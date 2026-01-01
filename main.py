@@ -126,6 +126,11 @@ class EPDFViewer:
         # Compteur pour afficher le message de cache moins souvent
         self.cache_clean_count = 0
 
+        # Scanner le répertoire de départ au lancement
+        start_dir = Path.cwd()
+        self.current_directory = start_dir
+        self.scan_directory(start_dir)
+
     def scan_directory(self, path: Path, recursive: bool = False):
         """Scanner un dossier pour les EPUB/PDF et les sous-dossiers"""
         self.books.clear()
@@ -879,7 +884,7 @@ class EPDFViewer:
 
         pattern = simpledialog.askstring(
             "Recherche par regex",
-            "Entrez un pattern regex pour filtrer les noms de fichiers:\n(ex: .*Tolkien.*, ^Le.*epub$, .*[0-9]{4}.*)"
+            "Entrez un pattern regex pour filtrer:\n(Recherche dans: nom, auteur, éditeur)\n(ex: .*Tolkien.*, ^Le.*epub$, .*[0-9]{4}.*)"
         )
 
         root.destroy()
@@ -889,8 +894,37 @@ class EPDFViewer:
                 # Compiler le pattern pour vérifier qu'il est valide
                 regex = re.compile(pattern, re.IGNORECASE)
 
-                # Filtrer les livres
-                self.books = [book for book in self.all_books if regex.search(book['name'])]
+                # Filtrer les livres en cherchant dans le nom, l'auteur et l'éditeur
+                filtered_books = []
+                for book in self.all_books:
+                    # Ne pas chercher dans les métadonnées des dossiers
+                    if book.get('type') == 'folder':
+                        if regex.search(book['name']):
+                            filtered_books.append(book)
+                        continue
+
+                    # Chercher dans le nom
+                    if regex.search(book['name']):
+                        filtered_books.append(book)
+                        continue
+
+                    # Charger les métadonnées si nécessaire
+                    path_str = str(book['path'])
+                    if path_str not in self.book_metadata:
+                        if book['type'] == 'epub':
+                            self.book_metadata[path_str] = self.load_epub_metadata(book['path'])
+                        elif book['type'] == 'pdf':
+                            self.book_metadata[path_str] = self.load_pdf_metadata(book['path'])
+
+                    # Chercher dans les métadonnées
+                    metadata = self.book_metadata.get(path_str, {})
+                    author = metadata.get('author', '')
+                    publisher = metadata.get('publisher', '')
+
+                    if (author and regex.search(author)) or (publisher and regex.search(publisher)):
+                        filtered_books.append(book)
+
+                self.books = filtered_books
                 self.search_pattern = pattern
                 self.scroll_offset = 0
                 self.update_scroll_limits()
