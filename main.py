@@ -55,11 +55,13 @@ class EPDFViewer:
 
         # État
         self.books: List[Dict] = []
+        self.all_books: List[Dict] = []  # Tous les livres (sans filtre)
         self.current_directory: Optional[Path] = None
         self.scroll_offset = 0
         self.max_scroll = 0
         self.running = True
         self.clock = pygame.time.Clock()
+        self.search_pattern = None  # Pattern regex pour la recherche
 
         # Menu
         self.menu_height = 25
@@ -74,6 +76,10 @@ class EPDFViewer:
                 {"label": "Rafraichir", "action": "refresh"},
                 {"label": "Trier par nom", "action": "sort_name"},
                 {"label": "Trier par taille", "action": "sort_size"}
+            ]},
+            {"label": "Rechercher", "items": [
+                {"label": "Par nom (regex)...", "action": "search_regex"},
+                {"label": "Afficher tout", "action": "show_all"}
             ]}
         ]
 
@@ -114,16 +120,32 @@ class EPDFViewer:
         self.context_menu_pos = (0, 0)
         self.context_menu_book = None
 
+        # Bouton Retour
+        self.back_button_rect = None
+
         # Compteur pour afficher le message de cache moins souvent
         self.cache_clean_count = 0
 
     def scan_directory(self, path: Path, recursive: bool = False):
-        """Scanner un dossier pour les EPUB/PDF"""
+        """Scanner un dossier pour les EPUB/PDF et les sous-dossiers"""
         self.books.clear()
+        self.all_books.clear()
         self.cover_cache.clear()
         self.cover_cache_order.clear()
         self.cover_loading.clear()
         self.covers_to_load.clear()
+        self.search_pattern = None
+
+        # Ajouter les dossiers (uniquement en mode non-récursif)
+        if not recursive:
+            for d in path.iterdir():
+                if d.is_dir() and not d.name.startswith('.'):
+                    self.all_books.append({
+                        'name': d.name,
+                        'path': d,
+                        'type': 'folder',
+                        'size': 0
+                    })
 
         if recursive:
             epub_files = list(path.rglob("*.epub"))
@@ -133,7 +155,7 @@ class EPDFViewer:
             pdf_files = list(path.glob("*.pdf"))
 
         for f in epub_files:
-            self.books.append({
+            self.all_books.append({
                 'name': f.name,
                 'path': f,
                 'type': 'epub',
@@ -141,16 +163,21 @@ class EPDFViewer:
             })
 
         for f in pdf_files:
-            self.books.append({
+            self.all_books.append({
                 'name': f.name,
                 'path': f,
                 'type': 'pdf',
                 'size': f.stat().st_size
             })
 
-        self.books.sort(key=lambda x: x['name'].lower())
+        # Trier: dossiers d'abord, puis fichiers par nom
+        self.all_books.sort(key=lambda x: (x['type'] != 'folder', x['name'].lower()))
+        self.books = self.all_books.copy()
         self.update_scroll_limits()
-        print(f"Trouvé {len(self.books)} livres")
+
+        folders_count = sum(1 for b in self.books if b['type'] == 'folder')
+        files_count = len(self.books) - folders_count
+        print(f"Trouvé {folders_count} dossier(s) et {files_count} livre(s)")
 
     def update_scroll_limits(self):
         """Calculer les limites de scroll"""
@@ -509,6 +536,15 @@ class EPDFViewer:
             # Clic dans la popup = ne rien faire
             return
 
+        # Clic sur le bouton Retour
+        if hasattr(self, 'back_button_rect') and self.back_button_rect and self.back_button_rect.collidepoint(x, y):
+            parent_dir = self.current_directory.parent
+            if parent_dir != self.current_directory:
+                self.current_directory = parent_dir
+                self.scan_directory(self.current_directory)
+                self.scroll_offset = 0
+            return
+
         # Clic sur la barre de menu (maintenant à droite du titre)
         menu_y = 10
         if 10 <= y < 35:  # Zone du menu (hauteur 25px)
@@ -550,14 +586,7 @@ class EPDFViewer:
 
             self.menu_open = None
 
-        # Clic sur le bouton "Ouvrir"
-        btn_x, btn_y = 30, 50
-        btn_w, btn_h = 200, 40
-        if btn_x <= x < btn_x + btn_w and btn_y <= y < btn_y + btn_h:
-            self.open_folder_dialog()
-            return
-
-        # Clic sur un livre
+        # Clic sur un livre ou dossier
         if self.books:
             cols = max(1, (self.width - 60) // (self.card_width + self.card_gap))
             start_x = 30
@@ -570,7 +599,12 @@ class EPDFViewer:
                 card_y = self.grid_start_y + row * (self.card_height + self.card_gap) - self.scroll_offset
 
                 if card_x <= x < card_x + self.card_width and card_y <= y < card_y + self.card_height:
-                    self.show_book_details(book)
+                    # Si c'est un dossier, l'ouvrir
+                    if book['type'] == 'folder':
+                        self.current_directory = book['path']
+                        self.scan_directory(self.current_directory)
+                    else:
+                        self.show_book_details(book)
                     return
 
     def handle_right_click(self, pos):
@@ -829,6 +863,49 @@ class EPDFViewer:
             self.books.sort(key=lambda x: x['name'].lower())
         elif action == 'sort_size':
             self.books.sort(key=lambda x: x['size'], reverse=True)
+        elif action == 'search_regex':
+            self.open_regex_search_dialog()
+        elif action == 'show_all':
+            self.show_all_books()
+
+    def open_regex_search_dialog(self):
+        """Ouvrir le dialogue de recherche regex"""
+        import re
+        from tkinter import simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+
+        pattern = simpledialog.askstring(
+            "Recherche par regex",
+            "Entrez un pattern regex pour filtrer les noms de fichiers:\n(ex: .*Tolkien.*, ^Le.*epub$, .*[0-9]{4}.*)"
+        )
+
+        root.destroy()
+
+        if pattern:
+            try:
+                # Compiler le pattern pour vérifier qu'il est valide
+                regex = re.compile(pattern, re.IGNORECASE)
+
+                # Filtrer les livres
+                self.books = [book for book in self.all_books if regex.search(book['name'])]
+                self.search_pattern = pattern
+                self.scroll_offset = 0
+                self.update_scroll_limits()
+
+                print(f"Recherche '{pattern}': {len(self.books)} livre(s) trouvé(s)")
+            except re.error as e:
+                print(f"Pattern regex invalide: {e}")
+
+    def show_all_books(self):
+        """Afficher tous les livres (supprimer le filtre)"""
+        self.books = self.all_books.copy()
+        self.search_pattern = None
+        self.scroll_offset = 0
+        self.update_scroll_limits()
+        print(f"Affichage de tous les livres: {len(self.books)} livre(s)")
 
     def render(self):
         """Dessiner l'écran"""
@@ -842,23 +919,53 @@ class EPDFViewer:
         self.screen.blit(title, (30, 10))
 
         # Menu à droite du titre
-        self.render_menu()
+        menu_end_x = self.render_menu()
 
-        # Bouton ouvrir
-        btn_rect = pygame.Rect(30, 50, 200, 40)
-        pygame.draw.rect(self.screen, (60, 80, 160), btn_rect)
-        pygame.draw.rect(self.screen, self.COLOR_WHITE, btn_rect, 2)
-        btn_text = self.font_normal.render("Ouvrir un dossier", True, self.COLOR_WHITE)
-        self.screen.blit(btn_text, (btn_rect.x + 30, btn_rect.y + 10))
+        # Bouton Retour (si on n'est pas à la racine) - à droite du menu
+        if self.current_directory and self.current_directory.parent != self.current_directory:
+            back_button_x = menu_end_x + 20
+            back_button_y = 10
+            back_button_width = 100
+            back_button_height = 30
+
+            # Fond du bouton
+            pygame.draw.rect(self.screen, (60, 80, 180),
+                           (back_button_x, back_button_y, back_button_width, back_button_height))
+            pygame.draw.rect(self.screen, (200, 200, 200),
+                           (back_button_x, back_button_y, back_button_width, back_button_height), 2)
+
+            # Texte du bouton
+            back_text = self.font_small.render("← Retour", True, self.COLOR_WHITE)
+            text_x = back_button_x + (back_button_width - back_text.get_width()) // 2
+            text_y = back_button_y + (back_button_height - back_text.get_height()) // 2
+            self.screen.blit(back_text, (text_x, text_y))
+
+            # Stocker les coordonnées pour la détection de clic
+            self.back_button_rect = pygame.Rect(back_button_x, back_button_y, back_button_width, back_button_height)
+        else:
+            self.back_button_rect = None
 
         # Info
         if self.books:
-            info = f"{len(self.books)} livre(s) - Cache: {len(self.cover_cache)}/{self.max_cache_size}"
-            info_text = self.font_small.render(info, True, self.COLOR_WHITE)
-            self.screen.blit(info_text, (250, 60))
+            # Compter les dossiers et les livres
+            num_folders = sum(1 for b in self.books if b.get('type') == 'folder')
+            num_books = len(self.books) - num_folders
 
-        # Grille de livres
+            if self.search_pattern:
+                info = f"{num_books}/{len(self.all_books)} livre(s) - Filtre: {self.search_pattern}"
+            else:
+                if num_folders > 0:
+                    info = f"{num_folders} dossier(s) et {num_books} livre(s) - Cache: {len(self.cover_cache)}/{self.max_cache_size}"
+                else:
+                    info = f"{num_books} livre(s) - Cache: {len(self.cover_cache)}/{self.max_cache_size}"
+            info_text = self.font_small.render(info, True, self.COLOR_WHITE)
+            self.screen.blit(info_text, (30, 50))
+
+        # Grille de livres (avec clipping pour ne pas déborder sur le header)
+        clip_rect = pygame.Rect(0, self.grid_start_y, self.width, self.height - self.grid_start_y)
+        self.screen.set_clip(clip_rect)
         self.render_books()
+        self.screen.set_clip(None)  # Désactiver le clipping
 
         # Scrollbar
         if self.max_scroll > 0:
@@ -916,6 +1023,9 @@ class EPDFViewer:
 
             menu_x += menu_width
 
+        # Retourner la position finale du menu
+        return menu_x
+
     def render_books(self):
         """Dessiner la grille de livres"""
         if not self.books:
@@ -950,40 +1060,51 @@ class EPDFViewer:
             self.render_book_card(x, y, book)
 
     def render_book_card(self, x: int, y: int, book: Dict):
-        """Dessiner une carte de livre"""
+        """Dessiner une carte de livre ou dossier"""
         # Fond carte
         pygame.draw.rect(self.screen, self.COLOR_CARD, (x, y, self.card_width, self.card_height))
         pygame.draw.rect(self.screen, (180, 180, 180), (x, y, self.card_width, self.card_height), 1)
 
         # Zone couverture
         cover_height = 200
-        pygame.draw.rect(self.screen, self.COLOR_CARD_COVER, (x, y, self.card_width, cover_height))
 
-        # Couverture ou placeholder
-        path_str = str(book['path'])
-        cover = self.get_cover_surface(book)
+        # Si c'est un dossier, afficher une icône de dossier
+        if book['type'] == 'folder':
+            pygame.draw.rect(self.screen, (255, 200, 100), (x, y, self.card_width, cover_height))
 
-        if cover:
-            cx = x + (self.card_width - cover.get_width()) // 2
-            cy = y + (cover_height - cover.get_height()) // 2
-            self.screen.blit(cover, (cx, cy))
+            # Icône dossier (emoji ou texte)
+            folder_icon = self.font_big.render("📁", True, self.COLOR_WHITE)
+            icon_x = x + (self.card_width - folder_icon.get_width()) // 2
+            icon_y = y + cover_height // 2 - 30
+            self.screen.blit(folder_icon, (icon_x, icon_y))
         else:
-            # Vérifier si en cours de chargement
-            is_loading = path_str in self.cover_loading and path_str not in self.cover_cache
+            pygame.draw.rect(self.screen, self.COLOR_CARD_COVER, (x, y, self.card_width, cover_height))
 
-            if is_loading and book['type'] == 'epub':
-                # Afficher "..." pour indiquer le chargement
-                loading_text = self.font_normal.render("...", True, self.COLOR_WHITE)
-                lx = x + (self.card_width - loading_text.get_width()) // 2
-                ly = y + cover_height // 2 - 10
-                self.screen.blit(loading_text, (lx, ly))
+            # Couverture ou placeholder
+            path_str = str(book['path'])
+            cover = self.get_cover_surface(book)
+
+            if cover:
+                cx = x + (self.card_width - cover.get_width()) // 2
+                cy = y + (cover_height - cover.get_height()) // 2
+                self.screen.blit(cover, (cx, cy))
             else:
-                # Placeholder texte
-                type_text = "EPUB" if book['type'] == 'epub' else "PDF"
-                placeholder = self.font_big.render(type_text, True, self.COLOR_WHITE)
-                px = x + (self.card_width - placeholder.get_width()) // 2
-                py = y + cover_height // 2 - 15
-                self.screen.blit(placeholder, (px, py))
+                # Vérifier si en cours de chargement
+                is_loading = path_str in self.cover_loading and path_str not in self.cover_cache
+
+                if is_loading and book['type'] == 'epub':
+                    # Afficher "..." pour indiquer le chargement
+                    loading_text = self.font_normal.render("...", True, self.COLOR_WHITE)
+                    lx = x + (self.card_width - loading_text.get_width()) // 2
+                    ly = y + cover_height // 2 - 10
+                    self.screen.blit(loading_text, (lx, ly))
+                else:
+                    # Placeholder texte
+                    type_text = "EPUB" if book['type'] == 'epub' else "PDF"
+                    placeholder = self.font_big.render(type_text, True, self.COLOR_WHITE)
+                    px = x + (self.card_width - placeholder.get_width()) // 2
+                    py = y + cover_height // 2 - 15
+                    self.screen.blit(placeholder, (px, py))
 
         # Nom du fichier
         name = book['name']
