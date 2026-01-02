@@ -80,6 +80,10 @@ class EPDFViewer:
             {"label": "Rechercher", "items": [
                 {"label": "Par nom (regex)...", "action": "search_regex"},
                 {"label": "Afficher tout", "action": "show_all"}
+            ]},
+            {"label": "Analyser", "items": [
+                {"label": "Analyser récursivement...", "action": "analyze_recursive"},
+                {"label": "Recherche globale...", "action": "search_global"}
             ]}
         ]
 
@@ -130,6 +134,10 @@ class EPDFViewer:
         self.show_search_progress = False
         self.search_progress_message = ""
         self.search_progress_percent = 0.0
+
+        # Base de données JSON pour l'analyse récursive
+        self.json_database_path = Path.cwd() / "books_database.json"
+        self.global_books_database = []
 
         # Scanner le répertoire de départ au lancement
         start_dir = Path.cwd()
@@ -877,6 +885,10 @@ class EPDFViewer:
             self.open_regex_search_dialog()
         elif action == 'show_all':
             self.show_all_books()
+        elif action == 'analyze_recursive':
+            self.analyze_recursive()
+        elif action == 'search_global':
+            self.search_global()
 
     def open_regex_search_dialog(self):
         """Ouvrir le dialogue de recherche regex"""
@@ -967,6 +979,227 @@ class EPDFViewer:
         self.scroll_offset = 0
         self.update_scroll_limits()
         print(f"Affichage de tous les livres: {len(self.books)} livre(s)")
+
+    def analyze_recursive(self):
+        """Analyser récursivement tous les EPUB/PDF et créer une base de données JSONL (optimisé avec fenêtre glissante)"""
+        import json
+        import time
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+        if not self.current_directory:
+            print("Aucun répertoire sélectionné")
+            return
+
+        def process_book(file_path, file_type):
+            try:
+                st = file_path.stat()
+                if file_type == 'epub':
+                    metadata = self.load_epub_metadata(file_path)
+                else:
+                    metadata = self.load_pdf_metadata(file_path)
+
+                return {
+                    'name': file_path.name,
+                    'path': str(file_path),
+                    'type': file_type,
+                    'size': st.st_size,
+                    'title': metadata.get('title', ''),
+                    'author': metadata.get('author', ''),
+                    'publisher': metadata.get('publisher', ''),
+                    'description': metadata.get('description', ''),
+                    'language': metadata.get('language', ''),
+                    'date': metadata.get('date', '')
+                }
+            except Exception:
+                try:
+                    size = file_path.stat().st_size
+                except Exception:
+                    size = 0
+                return {
+                    'name': file_path.name,
+                    'path': str(file_path),
+                    'type': file_type,
+                    'size': size,
+                    'title': '',
+                    'author': '',
+                    'publisher': '',
+                    'description': '',
+                    'language': '',
+                    'date': ''
+                }
+
+        try:
+            self.show_search_progress = True
+            self.update_search_progress("Scan des fichiers...", 0.02)
+
+            epub_files = list(self.current_directory.rglob("*.epub"))
+            pdf_files = list(self.current_directory.rglob("*.pdf"))
+            total_files = len(epub_files) + len(pdf_files)
+
+            print(f"  -> {total_files} fichiers ({len(epub_files)} EPUB, {len(pdf_files)} PDF)")
+            if total_files == 0:
+                self.show_search_progress = False
+                return
+
+            # HDD Windows: 3 ou 4 threads max
+            max_workers = 4
+            # Nombre max de tâches en vol (évite l'explosion mémoire)
+            max_in_flight = 300
+
+            out_path = self.json_database_path.with_suffix(".jsonl")
+
+            processed = 0
+            last_ui = 0.0
+
+            # Itérateur sur tous les fichiers
+            def all_jobs():
+                for p in epub_files:
+                    yield (p, 'epub')
+                for p in pdf_files:
+                    yield (p, 'pdf')
+
+            jobs_iter = iter(all_jobs())
+
+            with open(out_path, "w", encoding="utf-8") as out_f:
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = set()
+
+                    # Pré-remplir la fenêtre
+                    for _ in range(min(max_in_flight, total_files)):
+                        try:
+                            p, t = next(jobs_iter)
+                        except StopIteration:
+                            break
+                        futures.add(ex.submit(process_book, p, t))
+
+                    while futures:
+                        done, futures = wait(futures, return_when=FIRST_COMPLETED)
+
+                        for fut in done:
+                            book_data = fut.result()
+                            out_f.write(json.dumps(book_data, ensure_ascii=False) + "\n")
+                            processed += 1
+
+                        # Re-remplir la fenêtre
+                        while len(futures) < max_in_flight:
+                            try:
+                                p, t = next(jobs_iter)
+                            except StopIteration:
+                                break
+                            futures.add(ex.submit(process_book, p, t))
+
+                        # UI: mise à jour max 5 fois par seconde
+                        now = time.time()
+                        if now - last_ui >= 0.2 or processed == total_files:
+                            progress = processed / total_files
+                            self.update_search_progress(f"Analyse: {processed}/{total_files}", progress)
+                            last_ui = now
+
+            print(f"✓ Analyse terminée: {total_files} livres → {out_path}")
+            self.update_search_progress("Terminé", 1.0)
+            pygame.time.wait(300)
+            self.show_search_progress = False
+
+        except Exception as e:
+            self.show_search_progress = False
+            print(f"Erreur lors de l'analyse: {e}")
+
+    def search_global(self):
+        """Rechercher dans la base de données JSON globale"""
+        import json
+        import re
+        from tkinter import simpledialog
+
+        # Charger la base de données si nécessaire
+        if not self.global_books_database:
+            if self.json_database_path.exists():
+                try:
+                    with open(self.json_database_path, 'r', encoding='utf-8') as f:
+                        self.global_books_database = json.load(f)
+                    print(f"Base de données chargée: {len(self.global_books_database)} livres")
+                except Exception as e:
+                    print(f"Erreur lors du chargement de la base de données: {e}")
+                    return
+            else:
+                print("Base de données non trouvée. Veuillez d'abord analyser le répertoire.")
+                return
+
+        # Demander le pattern de recherche
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+
+        pattern = simpledialog.askstring(
+            "Recherche globale",
+            f"Recherche dans {len(self.global_books_database)} livres:\n(Recherche dans: nom, titre, auteur, éditeur)\n(ex: .*Tolkien.*, ^Le.*epub$, .*[0-9]{{4}}.*)"
+        )
+
+        root.destroy()
+
+        if pattern:
+            try:
+                # Compiler le pattern
+                regex = re.compile(pattern, re.IGNORECASE)
+
+                # Activer la barre de progression
+                self.show_search_progress = True
+
+                print(f"Recherche globale de '{pattern}' dans {len(self.global_books_database)} livres...")
+
+                # Filtrer les livres
+                total_books = len(self.global_books_database)
+                filtered_books = []
+
+                for i, book_data in enumerate(self.global_books_database):
+                    # Mettre à jour la progression
+                    if i % 50 == 0 and total_books > 0:
+                        progress = i / total_books
+                        self.update_search_progress(f"Recherche: {i}/{total_books}", progress)
+
+                    # Chercher dans le nom, titre, auteur, éditeur
+                    if (regex.search(book_data.get('name', '')) or
+                        regex.search(book_data.get('title', '')) or
+                        regex.search(book_data.get('author', '')) or
+                        regex.search(book_data.get('publisher', ''))):
+
+                        # Reconstruire l'objet livre
+                        book = {
+                            'name': book_data['name'],
+                            'path': Path(book_data['path']),
+                            'type': book_data['type'],
+                            'size': book_data['size']
+                        }
+                        filtered_books.append(book)
+
+                        # Stocker les métadonnées en cache
+                        self.book_metadata[book_data['path']] = {
+                            'title': book_data.get('title', ''),
+                            'author': book_data.get('author', ''),
+                            'publisher': book_data.get('publisher', ''),
+                            'description': book_data.get('description', ''),
+                            'language': book_data.get('language', ''),
+                            'date': book_data.get('date', '')
+                        }
+
+                self.books = filtered_books
+                self.all_books = filtered_books.copy()
+                self.search_pattern = f"Global: {pattern}"
+                self.scroll_offset = 0
+                self.update_scroll_limits()
+
+                self.update_search_progress(f"Terminé: {len(self.books)} livre(s) trouvé(s)", 1.0)
+                print(f"✓ Recherche terminée: {len(self.books)} livre(s) trouvé(s)")
+
+                # Laisser voir la barre à 100% pendant un court instant
+                pygame.time.wait(500)
+                self.show_search_progress = False
+
+            except re.error as e:
+                self.show_search_progress = False
+                print(f"Pattern regex invalide: {e}")
+            except Exception as e:
+                self.show_search_progress = False
+                print(f"Erreur lors de la recherche: {e}")
 
     def render(self):
         """Dessiner l'écran"""
@@ -1574,11 +1807,28 @@ class EPDFViewer:
         self.screen.blit(percent_text, (percent_x, progress_bar_y + 5))
 
     def update_search_progress(self, message: str, percent: float):
-        """Mettre à jour la barre de progression de la recherche"""
+        """Mettre à jour la barre de progression de la recherche (optimisé)"""
+        import time
+        now = time.time()
+        if not hasattr(self, "_last_progress_draw"):
+            self._last_progress_draw = 0.0
+
         self.search_progress_message = message
         self.search_progress_percent = max(0.0, min(1.0, percent))
-        self.render()
-        pygame.event.pump()  # Traiter les événements pour éviter le blocage
+
+        if now - self._last_progress_draw >= 0.1:  # 10 fps
+            # fond simple
+            self.screen.fill(self.COLOR_BG)
+            pygame.draw.rect(self.screen, self.COLOR_HEADER, (0, 0, self.width, 100))
+            title = self.font_big.render("Visualiseur EPUB & PDF", True, self.COLOR_WHITE)
+            self.screen.blit(title, (30, 10))
+
+            # juste la barre
+            self.render_search_progress()
+            pygame.display.flip()
+            self._last_progress_draw = now
+
+        pygame.event.pump()
 
 
 def main():
