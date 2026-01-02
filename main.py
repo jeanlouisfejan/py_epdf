@@ -126,6 +126,11 @@ class EPDFViewer:
         # Compteur pour afficher le message de cache moins souvent
         self.cache_clean_count = 0
 
+        # Barre de progression pour la recherche
+        self.show_search_progress = False
+        self.search_progress_message = ""
+        self.search_progress_percent = 0.0
+
         # Scanner le répertoire de départ au lancement
         start_dir = Path.cwd()
         self.current_directory = start_dir
@@ -894,9 +899,21 @@ class EPDFViewer:
                 # Compiler le pattern pour vérifier qu'il est valide
                 regex = re.compile(pattern, re.IGNORECASE)
 
+                # Activer la barre de progression
+                self.show_search_progress = True
+
+                print(f"Recherche de '{pattern}' dans le répertoire courant...")
+
                 # Filtrer les livres en cherchant dans le nom, l'auteur et l'éditeur
+                total_books = len(self.all_books)
                 filtered_books = []
-                for book in self.all_books:
+
+                for i, book in enumerate(self.all_books):
+                    # Mettre à jour la progression
+                    if i % 10 == 0 and total_books > 0:
+                        progress = i / total_books
+                        self.update_search_progress(f"Recherche: {i}/{total_books}", progress)
+
                     # Ne pas chercher dans les métadonnées des dossiers
                     if book.get('type') == 'folder':
                         if regex.search(book['name']):
@@ -929,12 +946,22 @@ class EPDFViewer:
                 self.scroll_offset = 0
                 self.update_scroll_limits()
 
-                print(f"Recherche '{pattern}': {len(self.books)} livre(s) trouvé(s)")
+                self.update_search_progress(f"Terminé: {len(self.books)} livre(s) trouvé(s)", 1.0)
+                print(f"✓ Recherche terminée: {len(self.books)} livre(s) trouvé(s)")
+
+                # Laisser voir la barre à 100% pendant un court instant
+                pygame.time.wait(500)
+                self.show_search_progress = False
+
             except re.error as e:
+                self.show_search_progress = False
                 print(f"Pattern regex invalide: {e}")
+            except Exception as e:
+                self.show_search_progress = False
+                print(f"Erreur lors de la recherche: {e}")
 
     def show_all_books(self):
-        """Afficher tous les livres (supprimer le filtre)"""
+        """Afficher tous les livres du répertoire courant (supprimer le filtre de recherche)"""
         self.books = self.all_books.copy()
         self.search_pattern = None
         self.scroll_offset = 0
@@ -1020,6 +1047,10 @@ class EPDFViewer:
         # Popup de confirmation de suppression (au-dessus de tout)
         if self.show_delete_confirmation and self.selected_book:
             self.render_delete_confirmation_popup()
+
+        # Barre de progression de recherche (au-dessus de tout)
+        if self.show_search_progress:
+            self.render_search_progress()
 
         pygame.display.flip()
 
@@ -1490,6 +1521,64 @@ class EPDFViewer:
         no_x = btn_no_x + (btn_no_w - no_text.get_width()) // 2
         no_y = btn_no_y + (btn_no_h - no_text.get_height()) // 2
         self.screen.blit(no_text, (no_x, no_y))
+
+    def render_search_progress(self):
+        """Afficher la barre de progression de la recherche"""
+        # Overlay semi-transparent
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(200)
+        overlay.fill((0, 0, 0))
+        self.screen.blit(overlay, (0, 0))
+
+        # Dimensions de la barre de progression
+        bar_width = 600
+        bar_height = 120
+        bar_x = (self.width - bar_width) // 2
+        bar_y = (self.height - bar_height) // 2
+
+        # Fond
+        pygame.draw.rect(self.screen, self.COLOR_WHITE, (bar_x, bar_y, bar_width, bar_height))
+        pygame.draw.rect(self.screen, self.COLOR_HEADER, (bar_x, bar_y, bar_width, bar_height), 3)
+
+        # Titre
+        title_text = self.font_normal.render("Recherche en cours...", True, self.COLOR_TEXT_DARK)
+        title_x = bar_x + (bar_width - title_text.get_width()) // 2
+        self.screen.blit(title_text, (title_x, bar_y + 15))
+
+        # Message de progression
+        msg_text = self.font_small.render(self.search_progress_message, True, (80, 80, 80))
+        msg_x = bar_x + (bar_width - msg_text.get_width()) // 2
+        self.screen.blit(msg_text, (msg_x, bar_y + 45))
+
+        # Barre de progression
+        progress_bar_x = bar_x + 30
+        progress_bar_y = bar_y + 75
+        progress_bar_width = bar_width - 60
+        progress_bar_height = 25
+
+        # Fond de la barre
+        pygame.draw.rect(self.screen, (220, 220, 220),
+                        (progress_bar_x, progress_bar_y, progress_bar_width, progress_bar_height))
+        pygame.draw.rect(self.screen, (150, 150, 150),
+                        (progress_bar_x, progress_bar_y, progress_bar_width, progress_bar_height), 2)
+
+        # Barre de progression remplie
+        filled_width = int(progress_bar_width * self.search_progress_percent)
+        if filled_width > 0:
+            pygame.draw.rect(self.screen, (70, 130, 220),
+                           (progress_bar_x, progress_bar_y, filled_width, progress_bar_height))
+
+        # Pourcentage
+        percent_text = self.font_small.render(f"{int(self.search_progress_percent * 100)}%", True, self.COLOR_TEXT_DARK)
+        percent_x = bar_x + (bar_width - percent_text.get_width()) // 2
+        self.screen.blit(percent_text, (percent_x, progress_bar_y + 5))
+
+    def update_search_progress(self, message: str, percent: float):
+        """Mettre à jour la barre de progression de la recherche"""
+        self.search_progress_message = message
+        self.search_progress_percent = max(0.0, min(1.0, percent))
+        self.render()
+        pygame.event.pump()  # Traiter les événements pour éviter le blocage
 
 
 def main():
